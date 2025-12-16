@@ -1,0 +1,386 @@
+
+
+Sub CopyAndCleanEmails_OriginalLogic()
+    ' --- SETUP AND USER INPUT ---
+    Dim ws As Worksheet
+    Set ws = ActiveSheet
+
+    ' Prompt for source columns only
+    Dim sourceColsInput As String
+    sourceColsInput = InputBox("Enter up to 4 source column letters (coma seperated)(e.g., A,C):", "Source Columns")
+    If sourceColsInput = "" Then Exit Sub ' User cancelled
+
+    ' Parse the comma-separated input into an array
+    Dim sourceCols As Variant
+    sourceCols = Split(Replace(sourceColsInput, " ", ""), ",")
+    
+    ' --- INPUT VALIDATION ---
+    If UBound(sourceCols) > 3 Then
+        MsgBox "Error: A maximum of 4 source columns is allowed.", vbCritical
+        Exit Sub
+    End If
+    
+    Dim col As Variant
+    For Each col In sourceCols
+        If Not IsValidColumn(CStr(col)) Then
+            MsgBox "Error: Invalid source column letter '" & col & "'. Please enter valid column letters (e.g., A, B, AA).", vbCritical
+            Exit Sub
+        End If
+    Next col
+
+    ' --- APPLICATION SETTINGS FOR PERFORMANCE ---
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    ' --- PREPARE FOR PROCESSING (RIGHT-TO-LEFT) ---
+    ' Get column indices and sort them descending to handle column insertion correctly (right-to-left)
+    Dim sourceIndices() As Integer
+    ReDim sourceIndices(0 To UBound(sourceCols))
+    Dim i As Long, j As Long, temp As Long
+    For i = 0 To UBound(sourceCols)
+        sourceIndices(i) = ws.Range(sourceCols(i) & "1").Column
+    Next i
+
+    ' Simple Bubble Sort to sort indices descending
+    For i = 0 To UBound(sourceIndices) - 1
+        For j = i + 1 To UBound(sourceIndices)
+            If sourceIndices(i) < sourceIndices(j) Then
+                temp = sourceIndices(i)
+                sourceIndices(i) = sourceIndices(j)
+                sourceIndices(j) = temp
+            End If
+        Next j
+    Next i
+    
+    ' --- MAIN PROCESSING LOOP (RIGHT-TO-LEFT) ---
+    Dim sourceColIndex As Variant
+    Dim summaryLog As String: summaryLog = ""
+    
+    For Each sourceColIndex In sourceIndices
+        Dim sourceColLetter As String, destColLetter As String
+        sourceColLetter = Replace(ws.Cells(1, sourceColIndex).Address(True, False), "$1", "")
+        
+        Dim lastRow As Long
+        lastRow = ws.Cells(ws.Rows.Count, sourceColLetter).End(xlUp).Row
+        
+        If lastRow < 1 Then GoTo NextColumn ' Skip if column is empty
+        
+        ' 1. Insert and set up new destination column (to the right of the source column)
+        ws.Columns(sourceColIndex + 1).Insert Shift:=xlToRight
+        destColLetter = Replace(ws.Cells(1, sourceColIndex + 1).Address(True, False), "$1", "")
+        ws.Columns(sourceColLetter).Copy ws.Columns(destColLetter)
+        summaryLog = "Source: " & sourceColLetter & " -> Destination: " & destColLetter & vbCrLf & summaryLog
+        
+        ' 2. Load data into arrays for processing
+        Dim sourceDataArr As Variant, destDataArr As Variant
+        Dim dataRange As Range
+        Set dataRange = ws.Range(destColLetter & "1:" & destColLetter & lastRow)
+        sourceDataArr = ws.Range(sourceColLetter & "1:" & sourceColLetter & lastRow).Value
+        destDataArr = dataRange.Value
+
+        ' --- BEGIN ORIGINAL CLEANING LOGIC ---
+        Dim rowIndex As Long
+        Dim originalEmail As String, email As String, tempLower As String
+        Dim posAt As Long, posLastDot As Long, unwanted As String
+        Dim usernamePart As String, domainPart As String, newDomain As String
+        Dim ch As String, prevCh As String, nextCh As String
+        Dim ext As String, badEnding As Variant, badEndings As Variant
+        Dim domainStr As String, idxDot As Long, hostPart As String, restDomain As String
+        
+        For rowIndex = 1 To UBound(destDataArr, 1)
+            originalEmail = Trim(CStr(sourceDataArr(rowIndex, 1)))
+            email = Trim(CStr(destDataArr(rowIndex, 1)))
+
+            ' If cell is blank, keep it blank
+            If email = "" Then GoTo SaveChange
+            
+            ' If cell has less than 5 characters then clear it
+            If Len(email) < 5 Then
+                email = ""
+                GoTo SaveChange
+            End If
+            
+            ' Check for placeholder text (user's original logic)
+            tempLower = LCase(email)
+            If tempLower = "no-email" Or tempLower = "no email" _
+                Or tempLower = "nomail" Or tempLower = "not available" Then
+                email = ""
+                GoTo SaveChange
+            End If
+
+            ' If there is no "@" in the cell, leave it unmodified
+            If InStr(email, "@") = 0 Then GoTo SaveChange
+
+            ' If there is an angle bracket pair, extract content and finish
+            If InStr(email, "<") > 0 And InStr(email, ">") > InStr(email, "<") Then
+                email = Mid(email, InStr(email, "<") + 1, InStr(email, ">") - InStr(email, "<") - 1)
+                GoTo SaveChange
+            End If
+
+            ' 1. Remove all spaces
+            email = Replace(email, " ", "")
+            
+'2. Merge all extra @ into username
+Dim atCount As Long
+atCount = Len(email) - Len(Replace(email, "@", ""))
+If atCount > 1 Then
+    posAt = InStrRev(email, "@")  ' Use the last @ as the true separator
+    usernamePart = Left(email, posAt - 1)
+    usernamePart = Replace(usernamePart, "@", "")  ' Remove other @
+    domainPart = Mid(email, posAt + 1)
+    email = usernamePart & "@" & domainPart
+End If
+
+            ' 3. Process the domain portion (after the first "@")
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                usernamePart = Left(email, posAt)
+                domainPart = Mid(email, posAt + 1)
+                ' 3a. Collapse multiple adjacent periods
+                Do While InStr(domainPart, "..") > 0
+                    domainPart = Replace(domainPart, "..", ".")
+                Loop
+                ' 3b. Process commas in the domain
+                newDomain = ""
+                For j = 1 To Len(domainPart)
+                    ch = Mid(domainPart, j, 1)
+                    If ch = "," Then
+                        If j > 1 Then prevCh = Mid(domainPart, j - 1, 1) Else prevCh = ""
+                        If j < Len(domainPart) Then nextCh = Mid(domainPart, j + 1, 1) Else nextCh = ""
+                        If Not (prevCh = "." Or nextCh = ".") Then
+                            newDomain = newDomain & "."
+                        End If
+                    Else
+                        newDomain = newDomain & ch
+                    End If
+                Next j
+                domainPart = newDomain
+                email = usernamePart & domainPart
+            End If
+            
+            ' 4. Remove unwanted trailing characters
+            unwanted = ".,'<>{}[]_-0123456789`"
+            Do While Len(email) > 0 And InStr(unwanted, Right(email, 1)) > 0
+                email = Left(email, Len(email) - 1)
+            Loop
+            
+            ' 5. Convert the entire email to lowercase
+            email = LCase(email)
+            
+            ' NEW FEATURE CHECK from original code
+            If InStr(email, "windowslive") > 0 Or InStr(email, "outlookproperties") > 0 Or InStr(email, "livehd") > 0 Then
+                GoTo SaveChange
+            End If
+            
+            ' 6. Check the ending (substring after the last period) and fix bad endings
+            badEndings = Array(".xom", ".lcom", ".cvom", ".copm", ".coom", ".conm", ".con", ".comvvv", ".comv", ".comt", ".coms", ".comq", ".comp", ".como", ".comn", ".comm", ".coml", ".comj", ".comi", ".comg", ".come", ".comcom", ".comc", ".comb", ".com-alnm", ".coma", ".com.com", ".cok", ".clm", ".ckm", ".cin", ".ccom", ".cam", ".cnx", ".vom", ".c", ".cim", ".cpm", ".ctx", ".vim", ".comhelll", ".coimn", ".col", ".fom", ".cmo")
+            posLastDot = InStrRev(email, ".")
+            If posLastDot > 0 Then
+                ext = Mid(email, posLastDot)
+                For Each badEnding In badEndings
+                    If ext = badEnding Then
+                        email = Left(email, posLastDot - 1) & ".com"
+                        Exit For
+                    End If
+                Next badEnding
+            End If
+
+            ' 7. Remove duplicate ".com.com" occurrences
+            Do While InStr(email, ".com.com") > 0
+                email = Replace(email, ".com.com", ".com")
+            Loop
+
+            ' 8. Correct Yahoo misspellings
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                domainStr = Mid(email, posAt + 1)
+                idxDot = InStr(domainStr, ".")
+                If idxDot > 0 Then hostPart = Left(domainStr, idxDot - 1): restDomain = Mid(domainStr, idxDot) Else hostPart = domainStr: restDomain = ""
+                Dim yahooVariants: yahooVariants = Array("yaoo", "yajoo", "yahou", "yahool", "yaho", "yahhoo", "yahgoo", "yaahoo", "yaooh")
+                If InStr(hostPart, "yahoo") = 0 Then
+                    Dim v: For Each v In yahooVariants
+                        If hostPart = v Then hostPart = "yahoo": Exit For
+                    Next v
+                End If
+                email = Left(email, posAt) & hostPart & restDomain
+            End If
+
+            ' 9. Correct Outlook misspellings
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                domainStr = Mid(email, posAt + 1)
+                idxDot = InStr(domainStr, ".")
+                If idxDot > 0 Then hostPart = Left(domainStr, idxDot - 1): restDomain = Mid(domainStr, idxDot) Else hostPart = domainStr: restDomain = ""
+                Dim outlookVariants: outlookVariants = Array("outlouk", "outloook", "outlool", "outook", "outloock", "outloo", "outlokk", "outlok", "outlock", "outllook", "out", "oulook")
+                If InStr(hostPart, "outlook") = 0 Then
+                    Dim outVar: For Each outVar In outlookVariants
+                        If hostPart = outVar Then hostPart = "outlook": Exit For
+                    Next outVar
+                End If
+                email = Left(email, posAt) & hostPart & restDomain
+            End If
+
+            ' 10. Correct Gmail misspellings (including "gnail")
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                domainStr = Mid(email, posAt + 1)
+                idxDot = InStr(domainStr, ".")
+                If idxDot > 0 Then hostPart = Left(domainStr, idxDot - 1): restDomain = Mid(domainStr, idxDot) Else hostPart = domainStr: restDomain = ""
+                ' Added "gnail"
+                Dim gmailVariants: gmailVariants = Array("gnail", "gmsil", "gmoil", "gmmail", "gmil", "gmial", "gmi", "gmdj", "gmalil", "gmali", "gmal", "gmaiol", "gmaill", "gmailcom", "gmailc", "gmaiil", "gmai9l", "gmai", "gimel", "gimail", "gemil", "gemail", "gamol", "gamil", "gamial", "gamail", "gail")
+                If InStr(hostPart, "gmail") = 0 Then
+                    Dim gVar: For Each gVar In gmailVariants
+                        If hostPart = gVar Then hostPart = "gmail": Exit For
+                    Next gVar
+                End If
+                email = Left(email, posAt) & hostPart & restDomain
+            End If
+
+            ' 11. Correct Live misspellings (including "liv")
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                domainStr = Mid(email, posAt + 1)
+                idxDot = InStr(domainStr, ".")
+                If idxDot > 0 Then hostPart = Left(domainStr, idxDot - 1): restDomain = Mid(domainStr, idxDot) Else hostPart = domainStr: restDomain = ""
+                ' Added "liv"
+                Dim liveVariants: liveVariants = Array("liv", "life", "livel")
+                If InStr(hostPart, "live") = 0 Then
+                    Dim lVar: For Each lVar In liveVariants
+                        If hostPart = lVar Then hostPart = "live": Exit For
+                    Next lVar
+                End If
+                email = Left(email, posAt) & hostPart & restDomain
+            End If
+
+            ' 12. Correct iCloud misspellings
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                domainStr = Mid(email, posAt + 1)
+                idxDot = InStr(domainStr, ".")
+                If idxDot > 0 Then hostPart = Left(domainStr, idxDot - 1): restDomain = Mid(domainStr, idxDot) Else hostPart = domainStr: restDomain = ""
+                Dim icloudVariants: icloudVariants = Array("lcloud", "iicloud", "icould", "icoud", "icolud", "icluod", "iclould", "iclouds", "iclose", "icloid", "iclaoud", "icaoud", "ic;oud")
+                If InStr(hostPart, "icloud") = 0 Then
+                    Dim icVar: For Each icVar In icloudVariants
+                        If hostPart = icVar Then hostPart = "icloud": Exit For
+                    Next icVar
+                End If
+                email = Left(email, posAt) & hostPart & restDomain
+            End If
+
+            ' 13. Correct Hotmail misspellings
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                domainStr = Mid(email, posAt + 1)
+                idxDot = InStr(domainStr, ".")
+                If idxDot > 0 Then hostPart = Left(domainStr, idxDot - 1): restDomain = Mid(domainStr, idxDot) Else hostPart = domainStr: restDomain = ""
+                Dim hotmailVariants: hotmailVariants = Array("htomail", "htmail", "hoytmail", "hotrmail", "hotnmail", "hotnail", "hotmsil", "hotmsail", "hotmqil", "hotmnail", "hotmil", "hotmial", "hotmaol", "hotmaoil", "hotmali", "hotmal", "hotmaill", "hotmailcom", "hotmai", "hotmai", "hotmai", "hotl", "hotamil", "hotamail", "hotail", "hot", "hoptmail", "homail", "hoitmail", "hohtmail", "ho", "hmail", "hitmail", "hatmail", "otmail")
+                If InStr(hostPart, "hotmail") = 0 Then
+                    Dim hmVar: For Each hmVar In hotmailVariants
+                        If hostPart = hmVar Then hostPart = "hotmail": Exit For
+                    Next hmVar
+                End If
+                email = Left(email, posAt) & hostPart & restDomain
+            End If
+
+            ' 14. Force canonical host brands
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                domainStr = Mid(email, posAt + 1)
+                idxDot = InStr(domainStr, ".")
+                If idxDot > 0 Then
+                    hostPart = Left(domainStr, idxDot - 1)
+                    restDomain = Mid(domainStr, idxDot)
+                    Dim brands: brands = Array("yahoo", "icloud", "gmail", "outlook")
+                    Dim b: For Each b In brands
+                        If InStr(hostPart, b) > 0 Then
+                            hostPart = b
+                            Exit For
+                        End If
+                    Next b
+                    email = Left(email, posAt) & hostPart & restDomain
+                End If
+            End If
+
+            ' 15. Fix concatenated domains
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                Dim domainFull: domainFull = Mid(email, posAt + 1)
+                Select Case domainFull
+                    Case "yahoocom": email = Left(email, posAt) & "yahoo.com"
+                    Case "livecom": email = Left(email, posAt) & "live.com"
+                    Case "hotmailcom": email = Left(email, posAt) & "hotmail.com"
+                    Case "icloudcom": email = Left(email, posAt) & "icloud.com"
+                    Case "gmailcom": email = Left(email, posAt) & "gmail.com"
+                    Case "outlookcom": email = Left(email, posAt) & "outlook.com"
+                End Select
+            End If
+
+            ' 16. Append .com to bare domains
+            posAt = InStr(email, "@")
+            If posAt > 0 Then
+                Dim domainOnly: domainOnly = Mid(email, posAt + 1)
+                If InStr(domainOnly, ".") = 0 Then
+                    Dim canonicalBrands: canonicalBrands = Array("yahoo", "live", "hotmail", "icloud", "gmail", "outlook")
+                    Dim candidate: For Each candidate In canonicalBrands
+                        If domainOnly = candidate Then
+                            email = email & ".com"
+                            Exit For
+                        End If
+                    Next candidate
+                End If
+            End If
+            
+            ' Highlight the original source cell if a change was made
+SaveChange:
+    ' Determine highlight color
+    If email <> originalEmail Then
+        ' Check if the only difference is case
+        If StrComp(email, originalEmail, vbTextCompare) = 0 Then
+            ' Only case changed ? Blue
+            ws.Cells(rowIndex, sourceColIndex).Interior.Color = RGB(0, 176, 240) ' Blue
+        Else
+            ' Other changes ? Yellow
+            ws.Cells(rowIndex, sourceColIndex).Interior.Color = RGB(255, 255, 0) ' Yellow
+        End If
+    End If
+
+    ' Save the cleaned email back to destination
+    destDataArr(rowIndex, 1) = email
+Next rowIndex
+
+        ' --- END ORIGINAL CLEANING LOGIC ---
+
+        ' 5. Write the processed array back to the destination column
+        dataRange.Value = destDataArr
+
+NextColumn:
+    Next sourceColIndex
+
+    ' --- CLEANUP AND SUMMARY ---
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+
+    Dim summaryMsg As String
+    summaryMsg = "Email cleaning completed:" & vbCrLf & vbCrLf & summaryLog
+    
+    MsgBox summaryMsg, vbInformation
+End Sub
+
+
+Private Function IsValidColumn(ByVal colStr As String) As Boolean
+' Helper function to validate if a string is a valid Excel column identifier.
+    Dim i As Integer
+    colStr = UCase(colStr)
+    If Len(colStr) = 0 Or Len(colStr) > 3 Then IsValidColumn = False: Exit Function
+    For i = 1 To Len(colStr)
+        If Mid(colStr, i, 1) < "A" Or Mid(colStr, i, 1) > "Z" Then IsValidColumn = False: Exit Function
+    Next i
+    IsValidColumn = True
+End Function
+
+
+
+
+
